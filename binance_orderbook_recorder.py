@@ -239,7 +239,7 @@ class Recorder:
                             # Book mode: buffer until we have loaded snapshot+synced
                             self.buffer.append(data)
                             await self._maybe_sync_and_apply()
-            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosedError, websockets.exceptions.InvalidStatusCode) as e:
+            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosedError, websockets.exceptions.InvalidStatus) as e:
                 logging.warning(f"WS error: {e}. Reconnecting soon...")
             except Exception as e:
                 logging.exception(f"Unexpected error in WS consume: {e}")
