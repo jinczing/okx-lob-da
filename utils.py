@@ -7,13 +7,14 @@ with support for various timeframes, trading pairs, and date ranges.
 
 import os
 import time
+import json
 import hmac
 import hashlib
 import base64
 import requests
 import pandas as pd
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Any
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -145,6 +146,132 @@ class OKXClient:
             raise OKXAPIError(f"Request failed: {str(e)}")
         except ValueError as e:
             raise OKXAPIError(f"Invalid JSON response: {str(e)}")
+
+
+def parse_okx_orderbook_file(
+    file_path: Union[str, os.PathLike],
+    as_dataframe: bool = True,
+    convert_timestamp: bool = True
+) -> Union[pd.DataFrame, List[Dict[str, Any]]]:
+    """
+    Parse a local OKX Level 2 orderbook dump (newline-delimited JSON) into structured data.
+
+    Args:
+        file_path: Path to the `.data` file downloaded from OKX.
+        as_dataframe: Return a `pandas.DataFrame` when True, otherwise return a list of dictionaries.
+        convert_timestamp: When True, append a UTC `timestamp` derived from the millisecond `ts`.
+
+    Returns:
+        pandas.DataFrame or list: Orderbook rows with columns/keys:
+            ['instrument', 'action', 'side', 'price', 'size', 'count', 'ts', 'timestamp' (optional)]
+
+    Raises:
+        FileNotFoundError: If `file_path` does not point to an existing file.
+        ValueError: If any line in the file cannot be decoded as JSON.
+    """
+    path_str = os.fspath(file_path)
+    if not os.path.exists(path_str):
+        raise FileNotFoundError(f"File not found: {path_str}")
+
+    records: List[Dict[str, Any]] = []
+
+    with open(path_str, "r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+
+            try:
+                payload = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Failed to parse JSON on line {line_number}: {exc}") from exc
+
+            ts_raw = payload.get("ts")
+            try:
+                ts_value = int(ts_raw) if ts_raw is not None else None
+            except (TypeError, ValueError):
+                ts_value = None
+
+            instrument = payload.get("instId")
+            action = payload.get("action")
+
+            for side_key in ("bids", "asks"):
+                levels = payload.get(side_key) or []
+                side = "bid" if side_key == "bids" else "ask"
+
+                for level in levels:
+                    if not isinstance(level, (list, tuple)) or len(level) < 2:
+                        continue
+
+                    price_raw = level[0]
+                    size_raw = level[1]
+                    count_raw = level[2] if len(level) > 2 else None
+
+                    try:
+                        price_val = float(price_raw)
+                    except (TypeError, ValueError):
+                        price_val = None
+
+                    try:
+                        size_val = float(size_raw)
+                    except (TypeError, ValueError):
+                        size_val = None
+
+                    try:
+                        count_val = int(count_raw) if count_raw is not None else None
+                    except (TypeError, ValueError):
+                        count_val = None
+
+                    records.append(
+                        {
+                            "instrument": instrument,
+                            "action": action,
+                            "side": side,
+                            "price": price_val,
+                            "size": size_val,
+                            "count": count_val,
+                            "ts": ts_value,
+                        }
+                    )
+
+            # If no bids/asks were present, still keep a placeholder record so nothing is lost.
+            if not payload.get("bids") and not payload.get("asks"):
+                records.append(
+                    {
+                        "instrument": instrument,
+                        "action": action,
+                        "side": None,
+                        "price": None,
+                        "size": None,
+                        "count": None,
+                        "ts": ts_value,
+                    }
+                )
+
+    def _attach_timestamp(target_records: List[Dict[str, Any]]) -> None:
+        for record in target_records:
+            ts_entry = record.get("ts")
+            try:
+                record["timestamp"] = (
+                    pd.to_datetime(ts_entry, unit="ms", utc=True) if ts_entry is not None else pd.NaT
+                )
+            except (TypeError, ValueError, OverflowError):
+                record["timestamp"] = pd.NaT
+
+    if not as_dataframe:
+        if convert_timestamp:
+            _attach_timestamp(records)
+        return records
+
+    df = pd.DataFrame.from_records(records, columns=["instrument", "action", "side", "price", "size", "count", "ts"])
+
+    if df.empty:
+        return df
+
+    if convert_timestamp:
+        df["timestamp"] = pd.to_datetime(df["ts"], unit="ms", utc=True, errors="coerce")
+
+    return df
 
 
 def get_crypto_spot_data(

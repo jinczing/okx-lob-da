@@ -38,3 +38,7 @@ MANIFEST
 Thumbs.db
 
 /data/
+*.zip
+*.tar
+*.csv
+*.data
