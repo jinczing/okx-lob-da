@@ -151,7 +151,8 @@ class OKXClient:
 def parse_okx_orderbook_file(
     file_path: Union[str, os.PathLike],
     as_dataframe: bool = True,
-    convert_timestamp: bool = True
+    convert_timestamp: bool = True,
+    nrows: float | None = None
 ) -> Union[pd.DataFrame, List[Dict[str, Any]]]:
     """
     Parse a local OKX Level 2 orderbook dump (newline-delimited JSON) into structured data.
@@ -177,6 +178,9 @@ def parse_okx_orderbook_file(
 
     with open(path_str, "r", encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
+            if nrows is not None and line_number > nrows:
+                break
+
             raw_line = raw_line.strip()
             if not raw_line:
                 continue
