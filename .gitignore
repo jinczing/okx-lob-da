@@ -45,6 +45,7 @@ Thumbs.db
 *.data
 *.pkl
 *.pickle
+*.npz
 
 # rust
 /target/
