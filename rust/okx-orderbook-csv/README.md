@@ -17,7 +17,7 @@ cargo build --release   # binaries under target/release/
 ### `convert`
 
 ```
-cargo run -- convert -i ../../BTC-USDT-L2orderbook-400lv-2025-11-08.data -o ../../btc.csv
+cargo run -- convert -i ../../BTC-USDT-L2orderbook-400lv-2025-11-08.data -o ../../btcusdt.csv
 ```
 
 Options:
@@ -32,7 +32,7 @@ Options:
 Reads the CSV produced by `convert`, replaying snapshots + updates while emitting a snapshot every fixed interval (default 100 ms) for each instrument.
 
 ```
-cargo run -- rebuild -i ../../btc.csv -o ../../btc.snapshots.csv --freq-ms 100 --depth 20 --max-duration-minutes 10
+cargo run -- rebuild -i ../../btcusdt.csv -o ../../btc.snapshots.csv --freq-ms 100 --depth 20 --max-duration-minutes 10
 ```
 
 Key parameters:
