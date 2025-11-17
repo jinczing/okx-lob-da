@@ -15,3 +15,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tar = "0.4"
 zip = { version = "2.1", default-features = false, features = ["deflate"] }
+arrow = "57.0.0"
+parquet = { version = "57.0.0", default-features = false, features = ["arrow"] }

@@ -1,13 +1,19 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use humantime::parse_duration;
 use ordered_float::OrderedFloat;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 use serde::Deserialize;
 
 const DAY_MILLIS: u64 = 86_400_000;
@@ -28,6 +34,15 @@ fn run(cli: Cli) -> Result<()> {
     if cli.freq_ms == 0 {
         bail!("sampling frequency must be positive");
     }
+    if cli.freq_ms > DAY_MILLIS {
+        bail!("sampling frequency must be shorter than one day");
+    }
+    if cli.days_per_file == 0 {
+        bail!("days per file must be positive");
+    }
+
+    fs::create_dir_all(&cli.output_dir)
+        .with_context(|| format!("unable to create {}", cli.output_dir.display()))?;
 
     let sampling_days = dates_inclusive(cli.start, cli.end);
     let trade_dates = build_trade_dates(cli.start, cli.end);
@@ -37,59 +52,71 @@ fn run(cli: Cli) -> Result<()> {
     let mut trade_engine = TradeEngine::new(cli.trade_dir.clone(), trade_dates, cli.freq_ms)
         .context("unable to prepare trade stream")?;
     let mut order_book = OrderBook::new();
-    let mut writer = FeatureWriter::new(cli.output.clone(), cli.depth)?;
+    let output = OutputManager::new(cli.output_dir.clone(), cli.format, cli.depth)?;
 
-    if cli.freq_ms > DAY_MILLIS {
-        bail!("sampling frequency must be shorter than one day");
-    }
-
-    for day in sampling_days {
-        let day_start_ts = date_to_timestamp(day)?;
-        let day_end_ts = date_to_timestamp(day + ChronoDuration::days(1))?;
-
-        let mut ts = day_start_ts + cli.freq_ms;
-        if ts > day_end_ts {
-            bail!(
-                "sampling frequency {}ms produces no samples inside {}",
-                cli.freq_ms,
-                day
-            );
+    for chunk in sampling_days.chunks(cli.days_per_file) {
+        if chunk.is_empty() {
+            continue;
         }
-
-        while ts < day_end_ts {
-            emit_features(
-                ts,
+        let mut buffer = ChunkBuffer::new(cli.depth);
+        for &day in chunk {
+            process_day(
+                day,
+                cli.freq_ms,
+                cli.depth,
                 &mut l2_stream,
                 &mut trade_engine,
                 &mut order_book,
-                &mut writer,
-                cli.depth,
+                &mut buffer,
             )?;
-            ts += cli.freq_ms;
         }
-
-        emit_features(
-            day_end_ts,
-            &mut l2_stream,
-            &mut trade_engine,
-            &mut order_book,
-            &mut writer,
-            cli.depth,
-        )?;
+        let start = *chunk.first().unwrap();
+        let end = *chunk.last().unwrap();
+        output.write_chunk(start, end, buffer)?;
     }
 
-    writer.finish()?;
     Ok(())
 }
 
-fn emit_features(
+fn process_day(
+    day: NaiveDate,
+    freq_ms: u64,
+    depth: usize,
+    l2_stream: &mut L2Stream,
+    trade_engine: &mut TradeEngine,
+    order_book: &mut OrderBook,
+    buffer: &mut ChunkBuffer,
+) -> Result<()> {
+    let day_start_ts = date_to_timestamp(day)?;
+    let day_end_ts = date_to_timestamp(day + ChronoDuration::days(1))?;
+
+    let mut ts = day_start_ts + freq_ms;
+    if ts > day_end_ts {
+        bail!(
+            "sampling frequency {}ms produces no samples inside {}",
+            freq_ms,
+            day
+        );
+    }
+
+    while ts < day_end_ts {
+        let sample = collect_sample(ts, l2_stream, trade_engine, order_book, depth)?;
+        buffer.push(sample);
+        ts += freq_ms;
+    }
+
+    let sample = collect_sample(day_end_ts, l2_stream, trade_engine, order_book, depth)?;
+    buffer.push(sample);
+    Ok(())
+}
+
+fn collect_sample(
     ts: u64,
     l2_stream: &mut L2Stream,
     trade_engine: &mut TradeEngine,
     order_book: &mut OrderBook,
-    writer: &mut FeatureWriter,
     depth: usize,
-) -> Result<()> {
+) -> Result<FeatureSample> {
     l2_stream
         .advance_to(ts, order_book)
         .with_context(|| format!("failed while applying L2 events up to {}", ts))?;
@@ -98,15 +125,15 @@ fn emit_features(
         .with_context(|| format!("failed while aggregating trades up to {}", ts))?;
 
     let (asks, bids) = order_book.snapshot_sizes(depth);
-    writer.write_row(
+    Ok(FeatureSample {
         ts,
-        &asks,
-        &bids,
-        trade_engine.vwap(),
-        trade_engine.buy_volume(),
-        trade_engine.sell_volume(),
-    )?;
-    Ok(())
+        iso_time: format_timestamp(ts),
+        vwap: trade_engine.vwap(),
+        buy_volume: trade_engine.buy_volume(),
+        sell_volume: trade_engine.sell_volume(),
+        asks,
+        bids,
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -136,8 +163,28 @@ struct Cli {
     l2_dir: PathBuf,
     #[arg(long, default_value = "btcusdt_trade", value_name = "DIR")]
     trade_dir: PathBuf,
-    #[arg(long, default_value = "features.csv", value_name = "FILE")]
-    output: PathBuf,
+    #[arg(long, default_value = "features", value_name = "DIR")]
+    output_dir: PathBuf,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Csv,
+        help = "Output format: csv or parquet"
+    )]
+    format: OutputFormat,
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_name = "DAYS",
+        help = "How many days of data to store in a single file"
+    )]
+    days_per_file: usize,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum OutputFormat {
+    Csv,
+    Parquet,
 }
 
 fn parse_frequency_ms(src: &str) -> std::result::Result<u64, String> {
@@ -172,63 +219,216 @@ fn build_trade_dates(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
     dates
 }
 
-struct FeatureWriter {
-    writer: csv::Writer<File>,
-    depth: usize,
+struct FeatureSample {
+    ts: u64,
+    iso_time: String,
+    vwap: f64,
+    buy_volume: f64,
+    sell_volume: f64,
+    asks: Vec<f64>,
+    bids: Vec<f64>,
 }
 
-impl FeatureWriter {
-    fn new(path: PathBuf, depth: usize) -> Result<Self> {
+struct ChunkBuffer {
+    timestamps: Vec<i64>,
+    iso_times: Vec<String>,
+    vwap: Vec<f64>,
+    buy_volume: Vec<f64>,
+    sell_volume: Vec<f64>,
+    ask_columns: Vec<Vec<f64>>,
+    bid_columns: Vec<Vec<f64>>,
+}
+
+impl ChunkBuffer {
+    fn new(depth: usize) -> Self {
+        Self {
+            timestamps: Vec::new(),
+            iso_times: Vec::new(),
+            vwap: Vec::new(),
+            buy_volume: Vec::new(),
+            sell_volume: Vec::new(),
+            ask_columns: (0..depth).map(|_| Vec::new()).collect(),
+            bid_columns: (0..depth).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    fn push(&mut self, sample: FeatureSample) {
+        let FeatureSample {
+            ts,
+            iso_time,
+            vwap,
+            buy_volume,
+            sell_volume,
+            asks,
+            bids,
+        } = sample;
+        self.timestamps.push(ts as i64);
+        self.iso_times.push(iso_time);
+        self.vwap.push(vwap);
+        self.buy_volume.push(buy_volume);
+        self.sell_volume.push(sell_volume);
+        debug_assert_eq!(self.ask_columns.len(), asks.len());
+        for (col, value) in self.ask_columns.iter_mut().zip(asks.into_iter()) {
+            col.push(value);
+        }
+        debug_assert_eq!(self.bid_columns.len(), bids.len());
+        for (col, value) in self.bid_columns.iter_mut().zip(bids.into_iter()) {
+            col.push(value);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.timestamps.is_empty()
+    }
+}
+
+struct OutputManager {
+    base_dir: PathBuf,
+    format: OutputFormat,
+    schema: Arc<Schema>,
+    header: Vec<String>,
+}
+
+impl OutputManager {
+    fn new(base_dir: PathBuf, format: OutputFormat, depth: usize) -> Result<Self> {
+        let schema = build_schema(depth);
+        let header = build_header(depth);
+        Ok(Self {
+            base_dir,
+            format,
+            schema,
+            header,
+        })
+    }
+
+    fn write_chunk(&self, start: NaiveDate, end: NaiveDate, buffer: ChunkBuffer) -> Result<()> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let suffix = match self.format {
+            OutputFormat::Csv => "csv",
+            OutputFormat::Parquet => "parquet",
+        };
+        let file_name = format!(
+            "features-{}-{}.{}",
+            start.format("%Y-%m-%d"),
+            end.format("%Y-%m-%d"),
+            suffix
+        );
+        let path = self.base_dir.join(file_name);
+        match self.format {
+            OutputFormat::Csv => self.write_csv(&path, buffer),
+            OutputFormat::Parquet => self.write_parquet(&path, buffer),
+        }
+    }
+
+    fn write_csv(&self, path: &Path, buffer: ChunkBuffer) -> Result<()> {
+        let ChunkBuffer {
+            timestamps,
+            iso_times,
+            vwap,
+            buy_volume,
+            sell_volume,
+            ask_columns,
+            bid_columns,
+        } = buffer;
         let mut writer = csv::WriterBuilder::new()
             .has_headers(true)
             .from_path(&path)
             .with_context(|| format!("unable to create {}", path.display()))?;
-        let mut header = vec![
-            "timestamp".to_string(),
-            "iso_time".to_string(),
-            "vwap".to_string(),
-            "buy_volume".to_string(),
-            "sell_volume".to_string(),
-        ];
-        for i in 0..depth {
-            header.push(format!("ask_size_{}", i + 1));
+        writer.write_record(self.header.iter().map(|s| s.as_str()))?;
+        let rows = timestamps.len();
+        for idx in 0..rows {
+            let mut record = Vec::with_capacity(self.header.len());
+            record.push(timestamps[idx].to_string());
+            record.push(iso_times[idx].clone());
+            record.push(format_float(vwap[idx]));
+            record.push(format_float(buy_volume[idx]));
+            record.push(format_float(sell_volume[idx]));
+            for column in &ask_columns {
+                record.push(format_float(column[idx]));
+            }
+            for column in &bid_columns {
+                record.push(format_float(column[idx]));
+            }
+            writer.write_record(record)?;
         }
-        for i in 0..depth {
-            header.push(format!("bid_size_{}", i + 1));
-        }
-        writer.write_record(header)?;
-        Ok(Self { writer, depth })
-    }
-
-    fn write_row(
-        &mut self,
-        ts: u64,
-        asks: &[f64],
-        bids: &[f64],
-        vwap: f64,
-        buy_volume: f64,
-        sell_volume: f64,
-    ) -> Result<()> {
-        let mut record = Vec::with_capacity(5 + self.depth * 2);
-        record.push(ts.to_string());
-        record.push(format_timestamp(ts));
-        record.push(format_float(vwap));
-        record.push(format_float(buy_volume));
-        record.push(format_float(sell_volume));
-        for &value in asks {
-            record.push(format_float(value));
-        }
-        for &value in bids {
-            record.push(format_float(value));
-        }
-        self.writer.write_record(record)?;
+        writer.flush()?;
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
-        self.writer.flush()?;
-        Ok(())
+    fn write_parquet(&self, path: &Path, buffer: ChunkBuffer) -> Result<()> {
+        let ChunkBuffer {
+            timestamps,
+            iso_times,
+            vwap,
+            buy_volume,
+            sell_volume,
+            ask_columns,
+            bid_columns,
+        } = buffer;
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.header.len());
+        arrays.push(Arc::new(Int64Array::from(timestamps)) as ArrayRef);
+        arrays.push(Arc::new(StringArray::from(iso_times)) as ArrayRef);
+        arrays.push(Arc::new(Float64Array::from(vwap)) as ArrayRef);
+        arrays.push(Arc::new(Float64Array::from(buy_volume)) as ArrayRef);
+        arrays.push(Arc::new(Float64Array::from(sell_volume)) as ArrayRef);
+        for column in ask_columns {
+            arrays.push(Arc::new(Float64Array::from(column)) as ArrayRef);
+        }
+        for column in bid_columns {
+            arrays.push(Arc::new(Float64Array::from(column)) as ArrayRef);
+        }
+        let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
+        let props = WriterProperties::builder().build();
+        let file =
+            File::create(&path).with_context(|| format!("unable to create {}", path.display()))?;
+        let mut writer = ArrowWriter::try_new(file, self.schema.clone(), Some(props))?;
+        writer.write(&batch)?;
+        writer.close().map(|_| ()).map_err(|e| e.into())
     }
+}
+
+fn build_header(depth: usize) -> Vec<String> {
+    let mut header = vec![
+        "timestamp".to_string(),
+        "iso_time".to_string(),
+        "vwap".to_string(),
+        "buy_volume".to_string(),
+        "sell_volume".to_string(),
+    ];
+    for i in 0..depth {
+        header.push(format!("ask_size_{}", i + 1));
+    }
+    for i in 0..depth {
+        header.push(format!("bid_size_{}", i + 1));
+    }
+    header
+}
+
+fn build_schema(depth: usize) -> Arc<Schema> {
+    let mut fields = vec![
+        Field::new("timestamp", DataType::Int64, false),
+        Field::new("iso_time", DataType::Utf8, false),
+        Field::new("vwap", DataType::Float64, false),
+        Field::new("buy_volume", DataType::Float64, false),
+        Field::new("sell_volume", DataType::Float64, false),
+    ];
+    for i in 0..depth {
+        fields.push(Field::new(
+            format!("ask_size_{}", i + 1),
+            DataType::Float64,
+            false,
+        ));
+    }
+    for i in 0..depth {
+        fields.push(Field::new(
+            format!("bid_size_{}", i + 1),
+            DataType::Float64,
+            false,
+        ));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 fn format_timestamp(ts: u64) -> String {
