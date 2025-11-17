@@ -39,6 +39,8 @@ Thumbs.db
 
 # data
 /data/
+/btcusdt_l2/
+/btcusdt_trade/
 *.zip
 *.tar
 *.csv
