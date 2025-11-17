@@ -127,13 +127,11 @@ struct FeatureArgs {
 struct FeatureInstrumentState {
     bids: BTreeMap<OrderedFloat<f64>, f64>,
     asks: BTreeMap<OrderedFloat<f64>, f64>,
-    total_bid_volume: f64,
-    total_ask_volume: f64,
-    next_emit_ts: Option<i64>,
     trade_buy_volume: f64,
     trade_sell_volume: f64,
     trade_vwap_num: f64,
     trade_vwap_den: f64,
+    next_emit_ts: Option<i64>,
 }
 
 impl FeatureInstrumentState {
@@ -141,13 +139,11 @@ impl FeatureInstrumentState {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            total_bid_volume: 0.0,
-            total_ask_volume: 0.0,
-            next_emit_ts: None,
             trade_buy_volume: 0.0,
             trade_sell_volume: 0.0,
             trade_vwap_num: 0.0,
             trade_vwap_den: 0.0,
+            next_emit_ts: None,
         }
     }
 
@@ -160,17 +156,7 @@ impl FeatureInstrumentState {
         emit_output: bool,
         writer: &mut csv::Writer<File>,
     ) -> Result<()> {
-        self.ensure_anchor(event.ts);
-        if event.ts > i64::MIN {
-            self.emit_due_snapshots(
-                instrument,
-                event.ts.saturating_sub(1),
-                freq_ms,
-                depth,
-                emit_output,
-                writer,
-            )?;
-        }
+        self.emit_due_snapshots(instrument, event.ts, freq_ms, depth, emit_output, writer)?;
 
         match event.action.as_deref() {
             Some("snapshot") => self.apply_snapshot(&event.bids, &event.asks),
@@ -180,7 +166,7 @@ impl FeatureInstrumentState {
             }
         }
 
-        self.emit_due_snapshots(instrument, event.ts, freq_ms, depth, emit_output, writer)
+        Ok(())
     }
 
     fn handle_trade_event(
@@ -192,39 +178,25 @@ impl FeatureInstrumentState {
         emit_output: bool,
         writer: &mut csv::Writer<File>,
     ) -> Result<()> {
-        self.ensure_anchor(trade.ts);
-        if trade.ts > i64::MIN {
-            self.emit_due_snapshots(
-                instrument,
-                trade.ts.saturating_sub(1),
-                freq_ms,
-                depth,
-                emit_output,
-                writer,
-            )?;
-        }
+        self.emit_due_snapshots(instrument, trade.ts, freq_ms, depth, emit_output, writer)?;
         self.record_trade(trade);
-        self.emit_due_snapshots(instrument, trade.ts, freq_ms, depth, emit_output, writer)
+        Ok(())
     }
 
     fn apply_snapshot(&mut self, bids: &[(f64, f64)], asks: &[(f64, f64)]) {
         self.bids.clear();
         self.asks.clear();
-        self.total_bid_volume = 0.0;
-        self.total_ask_volume = 0.0;
         for &(price, size) in bids {
             if !price.is_finite() || !size.is_finite() || size <= 0.0 {
                 continue;
             }
             self.bids.insert(OrderedFloat(price), size);
-            self.total_bid_volume += size;
         }
         for &(price, size) in asks {
             if !price.is_finite() || !size.is_finite() || size <= 0.0 {
                 continue;
             }
             self.asks.insert(OrderedFloat(price), size);
-            self.total_ask_volume += size;
         }
     }
 
@@ -232,26 +204,19 @@ impl FeatureInstrumentState {
         if updates.is_empty() {
             return;
         }
-        let (book, total) = match side {
-            Side::Bid => (&mut self.bids, &mut self.total_bid_volume),
-            Side::Ask => (&mut self.asks, &mut self.total_ask_volume),
+        let book = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
         };
         for &(price, size) in updates {
             if !price.is_finite() || !size.is_finite() {
                 continue;
             }
             let key = OrderedFloat(price);
-            let prev = book.get(&key).copied().unwrap_or(0.0);
             if size > 0.0 {
                 book.insert(key, size);
             } else {
                 book.remove(&key);
-            }
-            let new_size = if size > 0.0 { size } else { 0.0 };
-            let delta = new_size - prev;
-            *total += delta;
-            if *total < 0.0 {
-                *total = 0.0;
             }
         }
     }
@@ -281,10 +246,14 @@ impl FeatureInstrumentState {
         emit_output: bool,
         writer: &mut csv::Writer<File>,
     ) -> Result<()> {
-        if self.next_emit_ts.is_none() {
-            self.next_emit_ts = Some(limit_ts);
-        }
         let freq = freq_ms.min(i64::MAX as u64) as i64;
+        if self.next_emit_ts.is_none() {
+            if limit_ts < 0 {
+                return Ok(());
+            }
+            let aligned = align_down(limit_ts, freq);
+            self.next_emit_ts = Some(aligned);
+        }
         while let Some(next_ts) = self.next_emit_ts {
             if next_ts > limit_ts {
                 break;
@@ -309,7 +278,7 @@ impl FeatureInstrumentState {
         writer: &mut csv::Writer<File>,
     ) -> Result<()> {
         let timestamp = ms_to_rfc3339_utc(ts);
-        let mut record = Vec::with_capacity(3 + depth * 2 + 5);
+        let mut record = Vec::with_capacity(3 + depth * 2 + 3);
         record.push(instrument.to_string());
         record.push(ts.to_string());
         record.push(timestamp);
@@ -323,8 +292,6 @@ impl FeatureInstrumentState {
         record.push(vwap.to_string());
         record.push(self.trade_buy_volume.to_string());
         record.push(self.trade_sell_volume.to_string());
-        record.push(self.total_bid_volume.max(0.0).to_string());
-        record.push(self.total_ask_volume.max(0.0).to_string());
         writer.write_record(record)?;
         Ok(())
     }
@@ -368,10 +335,11 @@ impl FeatureInstrumentState {
         }
     }
 
-    fn ensure_anchor(&mut self, ts: i64) {
-        if self.next_emit_ts.is_none() {
-            self.next_emit_ts = Some(ts);
-        }
+    fn set_next_emit_ts(&mut self, ts: i64) {
+        self.next_emit_ts = Some(match self.next_emit_ts {
+            Some(existing) => existing.max(ts),
+            None => ts,
+        });
     }
 }
 
@@ -706,36 +674,31 @@ fn run_features(args: FeatureArgs) -> Result<()> {
     header.push("vwap".to_string());
     header.push("buy_volume".to_string());
     header.push("sell_volume".to_string());
-    header.push("total_bid_volume".to_string());
-    header.push("total_ask_volume".to_string());
     writer.write_record(header)?;
 
     let freq_ms = freq_ms.max(1);
     let instrument_filter = instrument.as_deref();
     let mut states: HashMap<String, FeatureInstrumentState> = HashMap::new();
 
+    let start_ms = date_to_ms(start_date)?;
     if let Some(prev_day) = start_date.pred_opt() {
-        if let Some(prev_path) = l2_archives.get(&prev_day) {
+        if let Some(prev_trade_path) = trade_archives.get(&prev_day) {
             eprintln!(
-                "Seeding order book state from previous day {} ({})",
-                prev_path.display(),
+                "Seeding trade state from previous day {} ({})",
+                prev_trade_path.display(),
                 prev_day
             );
-            process_day(
-                prev_path,
-                None,
-                &mut states,
+            seed_previous_day_trades(
+                prev_trade_path,
+                start_ms,
                 freq_ms,
-                depth,
                 instrument_filter,
-                false,
-                &mut writer,
+                &mut states,
             )?;
         } else {
             eprintln!(
-                "Warning: previous day {} not found in {}; first interval may start empty",
-                prev_day,
-                l2_dir.display()
+                "Warning: trade archive missing for previous day {}; first VWAP interval may start empty",
+                prev_day
             );
         }
     }
@@ -1036,6 +999,66 @@ fn read_trade_zip(path: &Path) -> Result<Vec<u8>> {
     bail!("No CSV payload found inside {}", path.display());
 }
 
+fn seed_previous_day_trades(
+    trade_path: &Path,
+    next_boundary_ms: i64,
+    freq_ms: u64,
+    instrument_filter: Option<&str>,
+    states: &mut HashMap<String, FeatureInstrumentState>,
+) -> Result<()> {
+    let data = read_trade_zip(trade_path)?;
+    let interval_start = next_boundary_ms.saturating_sub(freq_ms.min(i64::MAX as u64) as i64);
+    let cursor = Cursor::new(data);
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(cursor);
+    for record_res in reader.records() {
+        let record = record_res?;
+        let instrument = match record.get(0) {
+            Some(val) if !val.is_empty() => val.to_string(),
+            _ => continue,
+        };
+        if let Some(filter) = instrument_filter {
+            if instrument != filter {
+                continue;
+            }
+        }
+        let ts = match record.get(5).and_then(|v| v.parse::<i64>().ok()) {
+            Some(value) => value,
+            None => continue,
+        };
+        if ts < interval_start || ts >= next_boundary_ms {
+            continue;
+        }
+        let price = match record.get(3).and_then(|v| v.parse::<f64>().ok()) {
+            Some(value) => value,
+            None => continue,
+        };
+        let size = match record.get(4).and_then(|v| v.parse::<f64>().ok()) {
+            Some(value) => value,
+            None => continue,
+        };
+        let side = match record.get(2).map(|s| s.to_ascii_lowercase()) {
+            Some(ref s) if s == "buy" => TradeSide::Buy,
+            Some(ref s) if s == "sell" => TradeSide::Sell,
+            _ => continue,
+        };
+        let trade = TradeEvent {
+            instrument: instrument.clone(),
+            ts,
+            side,
+            price,
+            size,
+        };
+        let state = states
+            .entry(instrument.clone())
+            .or_insert_with(FeatureInstrumentState::new);
+        state.record_trade(&trade);
+        state.set_next_emit_ts(next_boundary_ms);
+    }
+    Ok(())
+}
+
 enum ArchiveKind {
     Orderbook,
     Trade,
@@ -1065,6 +1088,14 @@ fn collect_archives(dir: &Path, kind: ArchiveKind) -> Result<BTreeMap<NaiveDate,
         }
     }
     Ok(map)
+}
+
+fn date_to_ms(date: NaiveDate) -> Result<i64> {
+    let dt = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| anyhow!("Invalid date: {}", date))?;
+    let utc: DateTime<Utc> = Utc.from_utc_datetime(&dt);
+    Ok(utc.timestamp_millis())
 }
 
 fn parse_ymd(input: &str) -> Result<NaiveDate> {
@@ -1131,6 +1162,13 @@ fn extract_levels(value: Option<&Value>) -> Vec<(f64, f64)> {
         }
     }
     levels
+}
+
+fn align_down(ts: i64, freq: i64) -> i64 {
+    if freq <= 0 {
+        return ts;
+    }
+    ts - (ts % freq)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

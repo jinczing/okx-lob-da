@@ -72,7 +72,7 @@ Key parameters:
 - `--instrument`: Optional instrument filter (all instruments are processed when omitted).
 - `-o, --output`: Destination CSV (defaults to `<l2-dir>/features.csv`).
 
-Each row is `instrument, ts, timestamp, bid_size_1..d, ask_size_1..d, vwap, buy_volume, sell_volume, total_bid_volume, total_ask_volume`. VWAP/buy/sell volumes come strictly from trade prints; depth/total volumes come from reconstructed L2 books.
+Each row is `instrument, ts, timestamp, bid_size_1..d, ask_size_1..d, vwap, buy_volume, sell_volume`. VWAP/buy/sell volumes come strictly from trade prints; depth columns come from reconstructed L2 books. The command also replays the previous day’s trades to seed the first interval so that the snapshot at (say) `2025-10-01T00:00:00Z` reflects executions that occurred in the final second of `2025-09-30`.
 
 ## Implementation notes
 

@@ -1,4 +1,4 @@
 [workspace]
-members = [
+members = [ "rust/okx-features",
     "rust/okx-orderbook-csv"
 ]
