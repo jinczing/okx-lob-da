@@ -931,7 +931,7 @@ impl TradeWindow {
     }
 
     fn vwap(&self) -> f64 {
-        if self.vwap_den.abs() < MIN_VOLUME {
+        if self.vwap_den < MIN_VOLUME {
             -1.0
         } else {
             self.vwap_num / self.vwap_den
