@@ -11,8 +11,9 @@ from pathlib import Path
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.stattools import acf, pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
-from sklearn.linear_model import LinearRegression
-from sklearn.model_selection import cross_val_score
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.metrics import roc_auc_score, mean_squared_error
 
 import scipy.stats as stats
 
@@ -132,29 +133,87 @@ def feature_concat(features_list):
     return pd.concat(features_list, axis=1)
 
 
-def load_okx_features(root: Path | str, max_files: int | None = None) -> pd.DataFrame:
-    """Load OKX parquet feature files with the cleaning used in hft_eda.
+# ---------------------------------------------------------------------------
+# Alpha modeling helpers
+# ---------------------------------------------------------------------------
+
+
+def prepare_supervised(series: pd.Series, lags: list[int], horizon: int) -> tuple[pd.DataFrame, pd.Series]:
+    """Build lagged features and aligned forward target for a time series."""
+
+    X = feature_shift(series, lags)
+    y = series.shift(-horizon)
+    valid = y.notna()
+    return X.loc[valid], y.loc[valid]
+
+
+def train_linear_alpha(series: pd.Series, lags: list[int], horizon: int, model=None):
+    """Fit a linear regression alpha on lagged features."""
+
+    model = model or LinearRegression()
+    X, y = prepare_supervised(series, lags, horizon)
+    model.fit(X, y)
+    preds = pd.Series(model.predict(X), index=X.index, name="pred")
+    mse = mean_squared_error(y, preds)
+    return model, preds, {"mse": mse}
+
+
+def train_logit_alpha(series: pd.Series, lags: list[int], horizon: int, model=None):
+    """Fit a logistic classifier on the sign of forward returns."""
+
+    model = model or LogisticRegression(max_iter=500)
+    X, y = prepare_supervised(series, lags, horizon)
+    y_sign = (y > 0).astype(int)
+    X_train, X_val, y_train, y_val = train_test_split(X, y_sign, test_size=0.2, shuffle=False)
+    model.fit(X_train, y_train)
+    prob = model.predict_proba(X_val)[:, 1]
+    auc = roc_auc_score(y_val, prob)
+    full_prob = pd.Series(model.predict_proba(X)[:, 1], index=X.index, name="prob_up")
+    return model, full_prob, {"val_auc": auc}
+
+
+def timestamp_ms_to_ns(ts_ms: pd.Series | np.ndarray) -> pd.Series:
+    """Convert millisecond timestamps to nanoseconds (hftbacktest default)."""
+
+    return pd.to_numeric(ts_ms, errors="coerce").astype("int64") * 1_000_000
+
+
+def load_okx_features(
+    root: Path | str,
+    max_files: int | None = None,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Load OKX parquet feature dataset quickly, mirroring the hft_eda cleaning.
 
     The function mirrors the notebook workflow: concatenate parquet parts,
     replace `vwap == -1` with NaN, forward-fill gaps, and drop remaining NaNs.
 
     Args:
-        root: Directory that holds `features-*.parquet` files.
-        max_files: Optionally limit the number of files to read (useful for quick EDA).
+        root: Directory that holds the parquet dataset (e.g., `features-*.parquet`).
+        max_files: Optionally limit the number of files to read (fallback path).
+        columns: Optional column subset to speed up IO.
 
     Returns:
         Cleaned DataFrame indexed by timestamp.
     """
 
     root = Path(root)
-    files = sorted(root.rglob("*.parquet"))
-    if max_files:
-        files = files[:max_files]
+    # Fast path: let pandas/pyarrow treat the directory as a parquet dataset.
+    books: pd.DataFrame
+    if max_files is None:
+        try:
+            books = pd.read_parquet(root, columns=columns)
+        except Exception:
+            files = sorted(root.rglob("*.parquet"))
+            if not files:
+                raise FileNotFoundError(f"No parquet files found under {root}")
+            books = pd.read_parquet(files, columns=columns)
+    else:
+        files = sorted(root.rglob("*.parquet"))[:max_files]
+        if not files:
+            raise FileNotFoundError(f"No parquet files found under {root}")
+        books = pd.read_parquet(files, columns=columns)
 
-    if not files:
-        raise FileNotFoundError(f"No parquet files found under {root}")
-
-    books = pd.concat((pd.read_parquet(p) for p in files), ignore_index=True)
     books.loc[books.vwap == -1, "vwap"] = np.nan
     books = books.ffill().dropna(how="any")
     books = books.set_index("timestamp").sort_index()
