@@ -56,6 +56,25 @@ Every output row contains:
 
 CSV outputs create `features-YYYY-MM-DD-YYYY-MM-DD.csv` files inside the chosen directory. Parquet outputs follow the same naming convention but are Arrow-native `.parquet` files, so the directory can be treated as a partitioned dataset.
 
+## Building hftbacktest feeds with `okx-backtest`
+
+Use the new Rust binary to stream raw L2 + trade archives into an `.npz` that matches `hftbacktest`'s event dtype (`data[ev, exch_ts, local_ts, px, qty, order_id, ival, fval]`, ns timestamps):
+
+```powershell
+cargo run -p okx-backtest -- \
+  --start 2025-10-01 --end 2025-10-02 `
+  --depth 50 --l2-dir btcusdt_l2 --trade-dir btcusdt_trade `
+  --output-dir backtests --instrument BTC-USDT `
+  --local-latency-ns 0ns --days-per-file 1
+```
+
+Notes:
+
+- Trades are stitched the same way as `okx-features`: the `end+1` trade archive is read so the 16:00–23:59 slice of the last day is included; data before `start 00:00` is dropped.
+- `--depth` truncates each message to the first N ask/bid levels (as published by OKX) to keep event volume manageable.
+- `--local-latency-ns` shifts `local_ts` relative to `exch_ts` for latency/queue modelling; `--skip-trades` emits depth-only feeds if you only want book events.
+- Output files are compressed NPZ by default; add `--uncompressed` if you prefer plain ZIP storage.
+
 ## Notebook
 
 - **feature_lab.ipynb** – Explore, visualize, or post-process the generated feature files. Update the filepaths in the first cell if you saved the features somewhere other than `features/`.
